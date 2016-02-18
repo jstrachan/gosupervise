@@ -7,11 +7,16 @@ import (
 	"os"
 
 	"golang.org/x/crypto/ssh"
-	"github.com/fabric8io/gosupervise/log"
+	"github.com/fabric8io/kansible/log"
 )
 
 // RemoteSshCommand invokes the given command on a host and port
-func RemoteSshCommand(user string, privateKey string, hostPort string, cmd string) error {
+func RemoteSshCommand(user string, privateKey string, host string, port string, cmd string) error {
+	if len(privateKey) == 0 {
+		return fmt.Errorf("Could not find PrivateKey for entry %s", host)
+	}
+	hostPort := host + ":" + port
+
 	sshConfig := &ssh.ClientConfig{
 		User: user,
 		Auth: []ssh.AuthMethod{

@@ -1,0 +1,29 @@
+machine:
+  services:
+    - docker
+
+dependencies:
+  pre:
+    - wget "https://github.com/Masterminds/glide/releases/download/0.8.2/glide-0.8.2-linux-amd64.tar.gz"
+    - mkdir -p $HOME/bin
+    - tar -vxz -C $HOME/bin --strip=1 -f glide-0.8.2-linux-amd64.tar.gz
+    - export PATH="$HOME/bin:$PATH" GLIDE_HOME="$HOME/.glide"
+    - export GO15VENDOREXPERIMENT=1
+    - export GOPATH=`pwd`
+
+  override:
+    - go version
+    - make bootstrap build test
+
+test:
+  override:
+    - echo yes
+
+deployment:
+  hub:
+    branch: master
+    owner: fabric8io
+    commands:
+      - docker build -t fabric8/kansible .
+      - docker login -e $DOCKER_EMAIL -u $DOCKER_USER -p $DOCKER_PASS
+      - docker push fabric8/kansible

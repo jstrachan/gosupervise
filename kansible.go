@@ -3,16 +3,16 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"strings"
 
 	"github.com/codegangsta/cli"
 
-	"github.com/fabric8io/gosupervise/ansible"
-	"github.com/fabric8io/gosupervise/log"
-	"github.com/fabric8io/gosupervise/k8s"
-	"github.com/fabric8io/gosupervise/ssh"
-	"github.com/fabric8io/gosupervise/winrm"
+	"github.com/fabric8io/kansible/ansible"
+	"github.com/fabric8io/kansible/log"
+	"github.com/fabric8io/kansible/ssh"
+	"github.com/fabric8io/kansible/winrm"
 
 	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
 )
@@ -26,8 +26,8 @@ var version = "0.1.0-unstable"
 
 func main() {
 	app := cli.NewApp()
-	app.Name = "gosupervise"
-	app.Usage = `Go Supervise
+	app.Name = "kansible"
+	app.Usage = `Kansible
 
 This command supervises a remote process inside a Pod inside Kubernetes to make
 it look and feel like legacy processes running outside of Kubernetes are really
@@ -77,18 +77,23 @@ running inside Docker inside Kubernetes.
 				},
 				cli.StringFlag{
 					Name:   "rc",
-					Value:  "rc.yml",
-					Usage:  "The YAML file of the ReplicationController for the supervisors",
+					Value:  "$KANSIBLE_RC",
+					Usage:  "The name of the ReplicationController for the supervisors",
 				},
 				cli.StringFlag{
 					Name:   "password",
-					Value:  "$GOSUPERVISE_PASSWORD",
+					Value:  "$KANSIBLE_PASSWORD",
 					Usage:  "The password used for WinRM connections",
 				},
-				cli.BoolFlag{
-					Name:   "winrm",
-					EnvVar: "GOSUPERVISE_WINRM",
-					Usage:  "Enables the use of WinRM instead of SSH",
+				cli.StringFlag{
+					Name:   "connection",
+					Value:  "$KANSIBLE_CONNECTION",
+					Usage:  "The Ansible connection type to use. Defaults to SSH unless 'winrm' is defined to use WinRM on Windows",
+				},
+				cli.StringFlag{
+					Name:   "bash",
+					Value:  "$KANSIBLE_BASH",
+					Usage:  "If specified a script is generated for running a bash like shell on the remote machine",
 				},
 			},
 		},
@@ -120,31 +125,32 @@ running inside Docker inside Kubernetes.
 			Flags: []cli.Flag{
 				cli.StringFlag{
 					Name:   "user",
-					Value:  "$GOSUPERVISE_USER",
+					Value:  "$KANSIBLE_USER",
 					Usage:  "The user to use on the remote connection",
 				},
 				cli.StringFlag{
 					Name:   "privatekey",
-					Value:  "$GOSUPERVISE_PRIVATEKEY",
+					Value:  "$KANSIBLE_PRIVATEKEY",
 					Usage:  "The private key used for SSH",
 				},
 				cli.StringFlag{
 					Name:   "host",
-					Value:  "$GOSUPERVISE_HOST",
+					Value:  "$KANSIBLE_HOST",
 					Usage:  "The host for the remote connection",
 				},
 				cli.StringFlag{
 					Name:   "command",
-					Value:  "$GOSUPERVISE_COMMAND",
+					Value:  "$KANSIBLE_COMMAND",
 					Usage:  "The remote command to invoke on the host",
 				},
 				cli.StringFlag{
 					Name:   "password",
 					Usage:  "The password if using WinRM to execute the command",
 				},
-				cli.BoolFlag{
-					Name:   "winrm",
-					Usage:  "Enables the use of WinRM instead of SSH",
+				cli.StringFlag{
+					Name:   "connection",
+					Value:  "$KANSIBLE_CONNECTION",
+					Usage:  "The Ansible connection type to use. Defaults to SSH unless 'winrm' is defined to use WinRM on Windows",
 				},
 			},
 		},
@@ -159,13 +165,18 @@ running inside Docker inside Kubernetes.
 }
 
 
-func osExpandAndVerify(c *cli.Context, name string) (string, error) {
+func osExpand(c *cli.Context, name string) string {
 	flag := c.String(name)
 	value := os.ExpandEnv(flag)
+	log.Debug("flag %s is %s", name, value)
+	return value
+}
+
+func osExpandAndVerify(c *cli.Context, name string) (string, error) {
+	value := osExpand(c, name)
 	if len(value) == 0 {
 		return "", fmt.Errorf("No parameter supplied for: %s", name)
 	}
-	log.Debug("flag %s is %s", name, value)
 	return value, nil
 }
 
@@ -241,26 +252,13 @@ func runAnsiblePod(c *cli.Context) {
 		ns = "default"
 	}
 
-	rcFile, err := osExpandAndVerify(c, "rc")
-	if err != nil {
-		fail(err)
-	}
-
-	port, err := osExpandAndVerifyGlobal(c, "port")
-	if err != nil {
-		fail(err)
-	}
 	inventory, err := osExpandAndVerify(c, "inventory")
 	if err != nil {
 		fail(err)
 	}
-	rc, err := k8s.ReadReplicationControllerFromFile(rcFile)
+	rcName, err := osExpandAndVerify(c, "rc")
 	if err != nil {
 		fail(err)
-	}
-	rcName := rc.ObjectMeta.Name
-	if len(rcName) == 0 {
-		log.Die("No ReplicationController name in the yaml file %s", rcFile)
 	}
 	hostEntry, err := ansible.ChooseHostAndPrivateKey(inventory, hosts, kubeclient, ns, rcName)
 	if err != nil {
@@ -268,23 +266,53 @@ func runAnsiblePod(c *cli.Context) {
 	}
 	host := hostEntry.Host
 	user := hostEntry.User
+	port := hostEntry.Port
+	if len(port) == 0 {
+		port, err = osExpandAndVerifyGlobal(c, "port")
+	}
+	if err != nil {
+		fail(err)
+	}
 
-	useWinRM := c.Bool("winrm") || hostEntry.UseWinRM
-	if useWinRM {
-		log.Info("Using WinRM to connect to the hosts %s", hosts)
-		password, err := osExpandAndVerify(c, "password")
+	connection := hostEntry.Connection
+	if len(connection) == 0 {
+		connection = c.String("connection")
+	}
+
+	bash := osExpand(c, "bash")
+	if len(bash) > 0 {
+		err = generateBashScript(bash, connection)
 		if err != nil {
-			fail(err)
+			log.Err("Failed to generate bash script at %s due to: %v", bash, err)
+		}
+	}
+
+	if connection == ansible.ConnectionWinRM {
+		log.Info("Using WinRM to connect to the hosts %s", hosts)
+		password := hostEntry.Password
+		if len(password) == 0 {
+			password, err = osExpandAndVerify(c, "password")
+			if err != nil {
+				fail(err)
+			}
 		}
 		err = winrm.RemoteWinRmCommand(user, password, host, port, command)
 	} else {
 		privatekey := hostEntry.PrivateKey
-		hostPort := host + ":" + port
-		err = ssh.RemoteSshCommand(user, privatekey, hostPort, command)
+		err = ssh.RemoteSshCommand(user, privatekey, host, port, command)
 	}
 	if err != nil {
 		log.Err("Failed: %v", err)
 	}
+}
+
+func generateBashScript(file string, connection string) error {
+	shellCommand := "bash"
+	if connection == ansible.ConnectionWinRM {
+		shellCommand = "PowerShell"
+	}
+	text :=  "#!/bin/sh\n" + "echo opening shell on remote machine...\n" + "kansible pod appservers " + shellCommand + "\n";
+	return ioutil.WriteFile(file, []byte(text), 0555)
 }
 
 func run(c *cli.Context) {
@@ -306,8 +334,8 @@ func run(c *cli.Context) {
 	if err != nil {
 		fail(err)
 	}
-	useWinRM := c.Bool("winrm")
-	if useWinRM {
+	connection := c.String("connection")
+	if connection == ansible.ConnectionWinRM {
 		password, err := osExpandAndVerify(c, "password")
 		if err != nil {
 			fail(err)
@@ -318,14 +346,9 @@ func run(c *cli.Context) {
 		if err != nil {
 			fail(err)
 		}
-		hostPort := host + ":" + port
-		err = ssh.RemoteSshCommand(user, privatekey, hostPort, command)
+		err = ssh.RemoteSshCommand(user, privatekey, host, port, command)
 	}
 	if err != nil {
 		log.Err("Failed: %v", err)
 	}
-}
-
-type Executor interface {
-	RemoteSshCommand(user string, privateKey string, hostPort string, cmd string) error
 }
