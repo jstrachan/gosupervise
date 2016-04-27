@@ -569,13 +569,12 @@ func applyOtherKubernetesResource(f *cmdutil.Factory, c *client.Client, ns strin
 	// TODO the following should work ideally but something's wrong with the loading of versioned schemas...
 	//return k8s.ApplyResource(f, c, ns, data, file)
 
-	// lets use the `oc` binary instead
-	isOc := true
-	binary, err := exec.LookPath("oc")
+	isOc := false
+	binary, err := exec.LookPath("kubectl")
 	if err != nil {
-		isOc = false
+		isOc = true
 		var err2 error
-		binary, err2 = exec.LookPath("kubectl")
+		binary, err2 = exec.LookPath("oc")
 		if err2 != nil {
 			return err
 		}
